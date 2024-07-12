@@ -1,0 +1,8 @@
+/compile_commands.json
+/.cache/
+
+*.o
+*.bc
+*.so
+*~
+.gdb_history
