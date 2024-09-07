@@ -3,6 +3,7 @@
  * Licensed under the BSD-3-Clause License (the "License").
  * You may not use this file except in compliance with the License.
  */
+
 #include "postgres.h"
 #include "fmgr.h"
 #include "utils/elog.h"
@@ -13,20 +14,20 @@
 
 PG_MODULE_MAGIC;
 
-static ExecutorStart_hook_type onExecutorStartPrev = NULL;
-static void onExecutorStart(QueryDesc *queryDesc, int eflags);
-
-static ExecutorEnd_hook_type onExecutorEndPrev = NULL;
-static void onExecutorEnd(QueryDesc *queryDesc);
+static ExecutorRun_hook_type onExecutorRunPrev;
+static void onExecutorRun(QueryDesc *queryDesc,
+						  ScanDirection direction,
+						  uint64 count,
+						  bool execute_once);
 
 static int disable_stz_fd = -1;
 
 void _PG_init(void);
-void _PG_init(void) 
+void _PG_init(void)
 {
 	int err;
 	int fd;
-	
+
 	fd = open("/uk/libukp/scale_to_zero_disable", O_WRONLY);
 	if (fd == -1)
 	{
@@ -36,11 +37,8 @@ void _PG_init(void)
 	}
 	disable_stz_fd = fd;
 
-	onExecutorStartPrev = ExecutorStart_hook;
-	ExecutorStart_hook = onExecutorStart;
-
-	onExecutorEndPrev = ExecutorEnd_hook;
-	ExecutorEnd_hook = onExecutorEnd;
+	onExecutorRunPrev = ExecutorRun_hook;
+	ExecutorRun_hook = onExecutorRun;
 }
 
 void _PG_fini(void);
@@ -49,51 +47,49 @@ void _PG_fini(void)
 	if (disable_stz_fd == -1)
 		return;
 
-	ExecutorStart_hook = onExecutorStartPrev;
-	ExecutorEnd_hook = onExecutorEndPrev;
+	ExecutorRun_hook = onExecutorRunPrev;
 
+	close(disable_stz_fd);
 	disable_stz_fd = -1;
 }
 
-static void onExecutorStart(QueryDesc *queryDesc, int eflags)
+static void ctrlScaleToZero(int disable)
 {
 	ssize_t res;
 	int err;
 
-	if (disable_stz_fd != -1)
-	{
-		res = write(disable_stz_fd, "+", 1);
-		if (res == -1) 
-		{
-			err = errno;
-			ereport(WARNING, errmsg("Unable to write into scale-to-zero control file: %d\n", err));
-		}
-	}
+	if (disable_stz_fd == -1)
+		return;
 
-	if (onExecutorStartPrev) {
-		(*onExecutorStartPrev)(queryDesc, eflags);
-	} else {
-		standard_ExecutorStart(queryDesc, eflags);
+	res = write(disable_stz_fd, (disable) ? "+" : "-", 1);
+	if (res == -1)
+	{
+		err = errno;
+		ereport(WARNING, errmsg("Unable to write into scale-to-zero control file: %d\n", err));
 	}
 }
 
-static void onExecutorEnd(QueryDesc *queryDesc)
+static void onExecutorRun(QueryDesc *queryDesc,
+						  ScanDirection direction,
+						  uint64 count,
+						  bool execute_once)
 {
-	ssize_t res;
-	int err;
 
-	if (disable_stz_fd != -1)
+	ctrlScaleToZero(1);
+
+	PG_TRY();
 	{
-		res = write(disable_stz_fd, "-", 1);
-		if (res == -1)
-		{
-			err = errno;
-			ereport(WARNING, errmsg("Unable to write into scale-to-zero control file: %d\n", err));
+		if (onExecutorRunPrev) {
+			(*onExecutorRunPrev)(queryDesc, direction, count,
+								 execute_once);
+		} else {
+			standard_ExecutorRun(queryDesc, direction, count,
+								 execute_once);
 		}
 	}
-
-	if (onExecutorEndPrev)
-		(*onExecutorEndPrev)(queryDesc);
-	else
-		standard_ExecutorEnd(queryDesc);
+	PG_FINALLY();
+	{
+		ctrlScaleToZero(0);
+	}
+	PG_END_TRY();
 }
